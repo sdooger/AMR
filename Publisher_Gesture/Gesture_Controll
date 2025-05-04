@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
+import mediapipe as mp
+import numpy as np
+import json
+
+class HandControlNode(Node):
+    def init(self):
+        super().init('hand_control_node')
+        
+        # Initialize MediaPipe Hands
+        self.mp_hands = mp.solutions.hands
+        self.hands = self.mp_hands.Hands(
+            model_complexity=0,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5)
+        self.mp_drawing = mp.solutions.drawing_utils
+        
+        # Initialize CV bridge
+        self.bridge = CvBridge()
+        
+        # Create publisher for String commands
+        self.cmd_pub = self.create_publisher(String, '/gesture_topic', 10)
+        
+        # For direct camera access
+        self.cap = cv2.VideoCapture(0)
+        
+        # Timer for periodic control updates
+        self.timer = self.create_timer(0.1, self.timer_callback)  # 10Hz
+        
+        # Control variables
+        self.hand_detected = False
+        self.proximity = 0
+        self.current_gesture = None
+        self.move_command = "Stop"
+        
+        self.get_logger().info("Hand Control Node initialized")
+
+    def normalize_depth(self, z, min_z=-0.4, max_z=0.1):
+        """Normalize depth to 0-100 range."""
+        z = np.clip(z, min_z, max_z)
+        return int(((max_z - z) / (max_z - min_z)) * 100)
+
+    # def detect_gesture(self, hand_landmarks, handedness):
+    #     """Detect gesture based on index finger direction."""
+    #     landmarks = hand_landmarks.landmark
+        
+    #     index_tip = landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
+    #     index_mcp = landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_MCP]
+        
+    #     dx = index_tip.x - index_mcp.x
+    #     dy = index_tip.y - index_mcp.y
+        
+    #     if abs(dx) > abs(dy):
+    #         if dx > 0:
+    #             return "Right" if handedness == "Right" else "Left"
+    #         else:
+    #             return "Left" if handedness == "Right" else "Right"
+    #     return None
+
+    def detect_gesture(self, hand_landmarks, handedness):
+        landmarks = hand_landmarks.landmark
+    
+        index_tip = landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_TIP]
+        index_mcp = landmarks[self.mp_hands.HandLandmark.INDEX_FINGER_MCP]
+        wrist = landmarks[self.mp_hands.HandLandmark.WRIST]
+    
+        dx = index_tip.x - index_mcp.x
+        dy = index_tip.y - index_mcp.y
+    
+    # Жест "UpRight" или "UpLeft" (палец вверх + наклон)
+        if index_tip.y < wrist.y:  # Если палец выше запястья = "вверх"
+            if dx > 0.1:  # Наклон вправо
+                return "UpRight"
+            elif dx < -0.1:  # Наклон влево
+                return "UpLeft"
+    
+    # Жест "UTurn" (большой палец отведён в сторону)
+        thumb_tip = landmarks[self.mp_hands.HandLandmark.THUMB_TIP]
+        if thumb_tip.x < wrist.x - 0.2:  # Если большой палец сильно слева
+            return "UTurn"
+    
+    # Старая логика для Left/Right
+        if abs(dx) > abs(dy):
+            if dx > 0:
+                return "Right" if handedness == "Right" else "Left"
+            else:
+                return "Left" if handedness == "Right" else "Right"
+        return None
+    def process_frame(self, frame):
+        """Process frame with MediaPipe and determine control commands."""
+        frame = cv2.flip(frame, 1)
+        frame.flags.writeable = False
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.hands.process(frame)
+        
+        frame.flags.writeable = True
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        self.hand_detected = False
+        self.current_gesture = None
+        self.proximity = 0
+        self.move_command = "Stop"
+        
+        if results.multi_hand_landmarks and results.multi_handedness:
+            self.hand_detected = True
+            
+            for hand_landmarks, handedness in zip(
+                results.multi_hand_landmarks, 
+                results.multi_handedness):
+                
+                self.mp_drawing.draw_landmarks(
+                    frame,
+                    hand_landmarks,
+                    self.mp_hands.HAND_CONNECTIONS)
+                
+                # Get depth from index finger
+                index_z = hand_landmarks.landmark[
+                    self.mp_hands.HandLandmark.INDEX_FINGER_TIP].z
+                self.proximity = self.normalize_depth(index_z)
+                
+                # Detect gesture (for turns)
+                gesture = self.detect_gesture(
+                    hand_landmarks, 
+                    handedness.classification[0].label)
+                if gesture:
+                    self.current_gesture = gesture
+        
+        # Determine forward/backward movement based on depth
+        if self.hand_detected:
+            if self.proximity <= 40:
+                self.move_command = "Backward"
+            elif self.proximity >= 61:
+                self.move_command = "Forward"
+        
+        return frame
+
+    def create_command_message(self):
+        """Create JSON formatted command message."""
+        command_data = {
+            "gesture": self.current_gesture,
+            "depth": self.proximity,
+            "movement": self.move_command,
+            "hand_detected": self.hand_detected  # Добавляем флаг обнаружения руки
+        }
+        return json.dumps(command_data)
+
+    # def create_command_message(self):
+    #     return json.dumps({
+    #         "gesture": self.current_gesture,
+    #         "depth": self.proximity,
+    #         "movement": self.move_command,
+    #         "hand_detected": self.hand_detected
+    #     })
+
+    def timer_callback(self):
+        """Periodic callback to send control commands."""
+        # Read camera frame
+        ret, frame = self.cap.read()
+        if not ret:
+            self.get_logger().warn("Failed to get camera frame")
+            return
+            
+        # Process frame
+        processed_frame = self.process_frame(frame)
+        
+        # Create and publish String message
+        msg = String()
+        msg.data = self.create_command_message()
+        self.cmd_pub.publish(msg)
+        
+        # Display the processed frame
+        cv2.imshow('Hand Control', processed_frame)
+        cv2.waitKey(1)
+
+    def destroy_node(self):
+        """Cleanup on node shutdown."""
+        self.cap.release()
+        cv2.destroyAllWindows()
+        self.hands.close()
+        super().destroy_node()
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = HandControlNode()
+    
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if name == 'main':
+    main()
